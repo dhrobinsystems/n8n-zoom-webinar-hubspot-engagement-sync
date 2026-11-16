@@ -45,6 +45,8 @@ I designed this workflow to put one accurate, de-duplicated engagement record pe
 
 ## 2. Architecture
 
+![n8n Zoom Webinar to HubSpot Engagement Sync Architecture](https://raw.githubusercontent.com/dhrobinsystems/n8n-zoom-webinar-hubspot-engagement-sync/main/workflow-overview.png)
+
 ```mermaid
 flowchart TD
     A[Zoom Webhook Trigger<br/>registration · joined · left · ended · url_validation] --> B[Verify Signature & Normalize Event<br/>x-zm-signature · replay window · ledger]
