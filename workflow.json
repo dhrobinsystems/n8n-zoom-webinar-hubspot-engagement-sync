@@ -1,0 +1,2009 @@
+{
+  "name": "n8n-zoom-webinar-hubspot-engagement-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "zoom-webinar-engagement",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "2a0d6b03-667a-5592-8413-55a3496777e4",
+      "name": "Zoom Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000c9",
+      "notes": "Zoom webinar events: registration_created, participant_joined/left, ended, plus endpoint.url_validation. Responds via Respond to Webhook nodes. 12 pinned fictional deliveries."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify Signature & Normalize Event    Mode: Run Once for All Items\n// Repo: n8n-zoom-webinar-hubspot-engagement-sync · dhRobin Systems\n// Zoom signs every delivery: x-zm-signature = \"v0=\" + hex HMAC-SHA256 of\n// \"v0:{x-zm-request-timestamp}:{raw body}\", keyed with the app's Secret Token.\n// • endpoint.url_validation → { plainToken, encryptedToken } (signature checked\n//   first; plainTokens that could be abused as a signing oracle are refused)\n// • webinar.registration_created / participant_joined / participant_left →\n//   one engagement item for the contact pipeline\n// • webinar.ended → one report item (attendance + Q&A summaries per attendee)\n// Replay window, idempotency ledger, e-mail normalisation, internal-domain filter.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !SANDBOX_MODE && !DRY_RUN;\nconst SANDBOX_SECRET = 'sandbox-fictional-zoom-secret-token-not-for-production';\nconst SECRET = env('ZOOM_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? SANDBOX_SECRET : '');\nconst TOLERANCE = Math.max(30, num('ZOOM_SIGNATURE_TOLERANCE_SECONDS', 300));\nconst EVENTS = new Set(csv('PROCESS_EVENT_TYPES', 'webinar.registration_created,webinar.participant_joined,webinar.participant_left,webinar.ended'));\nconst INTERNAL = new Set(csv('INTERNAL_EMAIL_DOMAINS', 'YOUR_COMPANY_DOMAIN.example').map((d) => d.toLowerCase()));\n// Sandbox fixtures add their own fictional internal domain after the items are read (see below).\nconst WEBINAR_IDS = csv('WEBINAR_ID_ALLOWLIST', '');\nconst LEDGER_DAYS = Math.max(1, num('EVENT_LEDGER_DAYS', 30));\n\nlet runId;\ntry { runId = 'zw_' + crypto.randomUUID(); } catch (error) { runId = 'zw_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN };\nconst items = $input.all();\nconst sharedFixtures = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\nif (sharedFixtures && Array.isArray(sharedFixtures.internalDomains)) for (const d of sharedFixtures.internalDomains) INTERNAL.add(String(d).toLowerCase());\n\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\nconst hmacHex = (msg) => crypto.createHmac('sha256', SECRET).update(msg, 'utf8').digest('hex');\n\nfunction verify(headers, raw) {\n  if (!crypto) return { ok: false, reason: 'crypto_module_unavailable' };\n  if (!SECRET) return { ok: false, reason: 'webhook_secret_not_configured' };\n  const sig = String(headers['x-zm-signature'] || '').trim();\n  const ts = String(headers['x-zm-request-timestamp'] || '').trim();\n  if (!sig) return { ok: false, reason: 'signature_header_missing' };\n  if (!/^\\d{10,13}$/.test(ts)) return { ok: false, reason: 'timestamp_header_missing' };\n  if (!safeEqual(sig.toLowerCase(), `v0=${hmacHex(`v0:${ts}:${raw}`)}`)) return { ok: false, reason: 'signature_mismatch' };\n  const tsSec = ts.length > 10 ? Math.floor(Number(ts) / 1000) : Number(ts);\n  // Fixtures carry fixed timestamps, so the replay window is enforced outside sandbox only.\n  if (!SANDBOX_MODE && Math.abs(Date.now() / 1000 - tsSec) > TOLERANCE) return { ok: false, reason: 'timestamp_outside_tolerance' };\n  return { ok: true };\n}\n\nconst email = (v) => { const s = String(v || '').trim().toLowerCase(); return /^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$/.test(s) ? s : null; };\nconst iso = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d.toISOString(); };\nconst uuidPath = (u) => (u && (u.startsWith('/') || u.includes('//')) ? encodeURIComponent(encodeURIComponent(u)) : encodeURIComponent(u || ''));\n\nconst staticData = $getWorkflowStaticData('global');\nconst ledger = PERSIST ? (staticData.zoomEngagementLedger = staticData.zoomEngagementLedger || {}) : JSON.parse(JSON.stringify(staticData.zoomEngagementLedger || {}));\nconst joins = PERSIST ? (staticData.zoomOpenSessions = staticData.zoomOpenSessions || {}) : JSON.parse(JSON.stringify(staticData.zoomOpenSessions || {}));\nconst nowMs = Date.now();\nfor (const [k, v] of Object.entries(ledger)) if (!v || nowMs - v.at > LEDGER_DAYS * 86400000) delete ledger[k];\nfor (const [k, v] of Object.entries(joins)) if (!v || nowMs - v.at > 2 * 86400000) delete joins[k];\nconst seen = new Set();\n\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const headers = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n  const b = body && typeof body === 'object' ? body : {};\n  const base = { run, sandboxFixtures: sharedFixtures, deliveryRef: `delivery-${index + 1}`, eventName: b.event ? String(b.event).slice(0, 60) : null };\n\n  const v = verify(headers, raw);\n  if (!v.ok) { out.push({ json: { ...base, kind: 'rejected', reason: v.reason, httpStatus: 401, response: { message: 'invalid signature' } } }); continue; }\n\n  if (b.event === 'endpoint.url_validation') {\n    const plain = b.payload && typeof b.payload.plainToken === 'string' ? b.payload.plainToken : '';\n    // A signing oracle guard: only short token-like strings are echoed back as HMACs.\n    if (!/^[A-Za-z0-9_-]{8,64}$/.test(plain)) { out.push({ json: { ...base, kind: 'rejected', reason: 'invalid_plain_token', httpStatus: 400, response: { message: 'invalid plainToken' } } }); continue; }\n    out.push({ json: { ...base, kind: 'url_validation', httpStatus: 200, response: { plainToken: plain, encryptedToken: hmacHex(plain) } } });\n    continue;\n  }\n  const ignore = (reason, extra = {}) => out.push({ json: { ...base, kind: 'ignored', reason, httpStatus: 200, response: { status: 'ignored' }, ...extra } });\n  if (!EVENTS.has(String(b.event))) { ignore('event_type_not_processed'); continue; }\n  const o = (b.payload && b.payload.object) || {};\n  const webinar = { id: o.id != null ? String(o.id) : null, uuid: o.uuid ? String(o.uuid) : null, uuidPath: uuidPath(o.uuid), topic: o.topic ? String(o.topic).slice(0, 200) : null,\n    startTime: iso(o.start_time), endTime: iso(o.end_time), scheduledMinutes: Number(o.duration) > 0 ? Number(o.duration) : null, timezone: o.timezone || null };\n  if (WEBINAR_IDS.length && !WEBINAR_IDS.includes(webinar.id)) { ignore('webinar_not_in_allowlist', { webinar }); continue; }\n  const eventTs = Number(b.event_ts) || nowMs;\n\n  if (b.event === 'webinar.ended') {\n    const key = `ended:${webinar.uuid}`;\n    if (seen.has(key) || ledger[key]) { ignore('duplicate_event', { webinar }); continue; }\n    seen.add(key);\n    out.push({ json: { ...base, kind: 'event', route: 'report', httpStatus: 200, response: { status: 'received' }, ledgerKey: key, webinar } });\n    continue;\n  }\n\n  let engagement;\n  if (b.event === 'webinar.registration_created') {\n    const r = o.registrant || {};\n    engagement = { type: 'registered', email: email(r.email), registrantId: r.id ? String(r.id) : null, occurredAt: iso(r.create_time) || new Date(eventTs).toISOString(),\n      firstName: r.first_name ? String(r.first_name).slice(0, 80) : null, lastName: r.last_name ? String(r.last_name).slice(0, 80) : null,\n      company: r.org ? String(r.org).slice(0, 120) : null, jobTitle: r.job_title ? String(r.job_title).slice(0, 120) : null, status: r.status || null };\n  } else {\n    const p = o.participant || {};\n    const pid = String(p.participant_uuid || p.user_id || p.id || '');\n    engagement = { type: b.event === 'webinar.participant_joined' ? 'joined' : 'left', email: email(p.email), registrantId: p.registrant_id ? String(p.registrant_id) : null, participantKey: pid || null,\n      occurredAt: iso(b.event === 'webinar.participant_joined' ? p.join_time : p.leave_time) || new Date(eventTs).toISOString(), leaveReason: p.leave_reason ? String(p.leave_reason).slice(0, 120) : null };\n    const sessionKey = `${webinar.uuid}:${pid}`;\n    if (engagement.type === 'joined' && pid) joins[sessionKey] = { at: nowMs, joinTime: engagement.occurredAt };\n    if (engagement.type === 'left') {\n      const joinIso = iso(p.join_time) || (joins[sessionKey] && joins[sessionKey].joinTime) || null;\n      engagement.joinTime = joinIso;\n      engagement.sessionMinutes = joinIso ? Math.max(0, Math.round((Date.parse(engagement.occurredAt) - Date.parse(joinIso)) / 60000)) : null;\n      delete joins[sessionKey];\n    }\n  }\n  if (!engagement.email) { ignore('participant_without_email', { webinar, engagementType: engagement.type }); continue; }\n  if (INTERNAL.has(engagement.email.split('@')[1])) { ignore('internal_email_domain', { webinar, engagementType: engagement.type }); continue; }\n  const key = `${engagement.type}:${webinar.uuid}:${engagement.email}:${engagement.participantKey || engagement.registrantId || ''}:${engagement.occurredAt}`;\n  if (seen.has(key) || ledger[key]) { ignore('duplicate_event', { webinar, engagementType: engagement.type }); continue; }\n  seen.add(key);\n  out.push({ json: { ...base, kind: 'event', route: 'contact', httpStatus: 200, response: { status: 'received' }, ledgerKey: key, webinar, engagement } });\n}\nreturn out;\n"
+      },
+      "id": "eb3c42df-eca0-5c91-97fb-f0fcf74638f9",
+      "name": "Verify Signature & Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "x-zm-signature over v0:{ts}:{raw body} · URL validation (oracle-safe) · replay window · e-mail normalisation · ledger."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8bb3e033-312a-546f-a25a-3a2bab13d0a4",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "url_validation",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "url_validation"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "350be180-1cf5-581a-85e2-45327c52c4a3",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "event",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "event"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "rejected_or_ignored"
+        }
+      },
+      "id": "2dbeb6a4-ca89-59a0-ac13-8bdcded5469f",
+      "name": "Route by Kind",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1a78c84c-e89a-5a0a-b717-5a3a9970eb9a",
+      "name": "Respond URL Validation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        100
+      ],
+      "notes": "Returns { plainToken, encryptedToken } within Zoom's 3-second window."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "fffd79ed-bd93-5b5d-bf16-d7185d14e229",
+      "name": "Acknowledge Event",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        300
+      ],
+      "notes": "200 straight away; processing continues after the response."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus || 200 }}"
+        }
+      },
+      "id": "2097aac6-b2c7-54b4-ae69-2ad3aaaa98de",
+      "name": "Respond Rejected or Ignored",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        500
+      ],
+      "notes": "401 for bad signatures, 200 for ignored events (so Zoom doesn't retry)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2423757-085d-5b97-bebb-c74aaaad80f7",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "report",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dce7f3fb-a06e-5526-ba44-9bc01ecd280f",
+      "name": "Webinar Ended?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4916ab13-8b88-5683-812d-9f1bc445f561",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "912a8766-45a1-5ec7-b472-bd8e6cc7e3c2",
+      "name": "Sandbox Reports?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Zoom Reports (Sandbox)       Mode: Run Once for Each Item\n// Fictional participant and Q&A reports in the shapes returned by\n// GET /report/webinars/{uuid}/participants and /report/webinars/{uuid}/qa.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst rep = ((item.sandboxFixtures || {}).reports || {})[item.webinar.uuid] || { participants: [], questions: [] };\nreturn { json: { ...item, simulatedReports: { participantPages: [{ statusCode: 200, body: { page_size: 300, total_records: rep.participants.length, next_page_token: '', participants: rep.participants } }],\n  qa: { statusCode: 200, body: { id: Number(item.webinar.id), uuid: item.webinar.uuid, questions: rep.questions } } } } };\n"
+      },
+      "id": "7003b1c3-6755-5e8d-9962-c36f689c12fa",
+      "name": "Simulate Zoom Reports (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": "={{ Math.max(1, Number($env.ZOOM_REPORT_DELAY_MINUTES || 15)) }}",
+        "unit": "minutes"
+      },
+      "id": "19bc5b45-2e84-5e29-982b-db5b8be37f69",
+      "name": "Wait for Zoom Reports",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        200
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000ca",
+      "notes": "Zoom finalises webinar reports a few minutes after the webinar ends (ZOOM_REPORT_DELAY_MINUTES)."
+    },
+    {
+      "parameters": {
+        "url": "=https://zoom.us/oauth/token?grant_type=account_credentials&account_id={{ encodeURIComponent($env.ZOOM_ACCOUNT_ID || '') }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Basic ' + (($env.ZOOM_CLIENT_ID || '') + ':' + ($env.ZOOM_CLIENT_SECRET || '')).base64Encode() }}"
+            }
+          ]
+        }
+      },
+      "id": "d4b3599f-7963-567d-b3b8-c961386585b8",
+      "name": "Get Zoom Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Server-to-Server OAuth · scopes report:read:admin (or granular report:read:list_webinar_participants:admin, report:read:webinar_qa:admin)."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.ZOOM_API_BASE_URL || 'https://api.zoom.us/v2' }}/report/webinars/{{ $('Webinar Ended?').first().json.webinar.uuidPath }}/qa",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get Zoom Access Token').first().json.body.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "fed23320-0326-58de-b392-54af1d022bd7",
+      "name": "Fetch Q&A Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "GET /report/webinars/{uuid}/qa · Webinar plan required."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.ZOOM_API_BASE_URL || 'https://api.zoom.us/v2' }}/report/webinars/{{ $('Webinar Ended?').first().json.webinar.uuidPath }}/participants?page_size=300",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000,
+          "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": {
+              "parameters": [
+                {
+                  "type": "qs",
+                  "name": "next_page_token",
+                  "value": "={{ $response.body.next_page_token }}"
+                }
+              ]
+            },
+            "paginationCompleteWhen": "other",
+            "completeExpression": "={{ !$response.body || !$response.body.next_page_token }}",
+            "limitPagesFetched": true,
+            "maxRequests": 20
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get Zoom Access Token').first().json.body.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "ef0e059f-7c9c-51c5-958e-8012bce1de1e",
+      "name": "Fetch Participants Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Paginated by next_page_token (max 20 pages)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Attendance Summaries            Mode: Run Once for All Items\n// After webinar.ended: merges every session per attendee (rejoins are\n// separate report rows), adds Q&A participation, scores engagement and\n// emits one 'attended' engagement item per external attendee.\n//   attendance % = attended minutes / webinar minutes (actual, else scheduled)\n//   tier: hot   ≥ HOT_ATTENDANCE_PCT (75) or (≥ 50 % and asked a question)\n//         warm  ≥ WARM_ATTENDANCE_PCT (40) or asked a question\n//         cold  attended, below warm · brief: under MIN_ATTENDED_MINUTES (5)\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst HOT = num('HOT_ATTENDANCE_PCT', 75);\nconst WARM = num('WARM_ATTENDANCE_PCT', 40);\nconst MIN_MIN = num('MIN_ATTENDED_MINUTES', 5);\nconst INCLUDE_Q_TEXT = flag('INCLUDE_QUESTION_TEXT', false);\nconst INTERNAL = new Set(csv('INTERNAL_EMAIL_DOMAINS', 'YOUR_COMPANY_DOMAIN.example').map((d) => d.toLowerCase()));\nconst email = (v) => { const s = String(v || '').trim().toLowerCase(); return /^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$/.test(s) ? s : null; };\n\nconst first = $input.first().json;\nconst sandbox = !!(first && first.simulatedReports);\nconst ctx = sandbox ? first : $('Webinar Ended?').first().json;\nconst pages = sandbox ? first.simulatedReports.participantPages : $input.all().map((i) => i.json);\nlet qaRes = sandbox ? first.simulatedReports.qa : null;\nif (!sandbox) { try { qaRes = $('Fetch Q&A Report').first().json; } catch (e) { qaRes = null; } }\nconst errors = [];\nconst rows = [];\nfor (const p of pages) { if (Number(p.statusCode) === 200 && p.body && Array.isArray(p.body.participants)) rows.push(...p.body.participants); else errors.push(`participants report ${p.statusCode || 'network error'}`); }\nconst questions = qaRes && Number(qaRes.statusCode) === 200 && qaRes.body && Array.isArray(qaRes.body.questions) ? qaRes.body.questions : [];\nif (qaRes && Number(qaRes.statusCode) !== 200) errors.push(`Q&A report ${qaRes.statusCode || 'network error'}`);\n\nconst w = ctx.webinar;\nif (ctx.sandboxFixtures && Array.isArray(ctx.sandboxFixtures.internalDomains)) for (const d of ctx.sandboxFixtures.internalDomains) INTERNAL.add(String(d).toLowerCase());\nconst spanMinutes = (() => { const t = rows.map((r) => [Date.parse(r.join_time), Date.parse(r.leave_time)]).filter(([a, b]) => a && b); if (!t.length) return null; return Math.round((Math.max(...t.map((x) => x[1])) - Math.min(...t.map((x) => x[0]))) / 60000); })();\nconst webinarMinutes = (w.startTime && w.endTime ? Math.round((Date.parse(w.endTime) - Date.parse(w.startTime)) / 60000) : null) || w.scheduledMinutes || spanMinutes || 60;\nconst stats = { reportRows: rows.length, excludedInternal: 0, excludedNoEmail: 0, attendees: 0, questions: questions.length, webinarMinutes, errors };\n\nconst by = {};\nfor (const r of rows) {\n  const e = email(r.user_email || r.email);\n  if (!e) { stats.excludedNoEmail++; continue; }\n  if (INTERNAL.has(e.split('@')[1])) { stats.excludedInternal++; continue; }\n  const a = (by[e] = by[e] || { email: e, seconds: 0, sessions: 0, firstJoin: null, lastLeave: null, registrantId: r.registrant_id || null, intervals: [] });\n  const j = Date.parse(r.join_time); const l = Date.parse(r.leave_time);\n  if (j && l && l > j) a.intervals.push([j, l]);\n  else a.seconds += Math.max(0, Number(r.duration) || 0);\n  a.sessions++;\n  if (j && (!a.firstJoin || j < a.firstJoin)) a.firstJoin = j;\n  if (l && (!a.lastLeave || l > a.lastLeave)) a.lastLeave = l;\n}\n// Merge overlapping intervals so two devices for one person aren't double-counted.\nfor (const a of Object.values(by)) {\n  const iv = a.intervals.sort((x, y) => x[0] - y[0]); let cur = null;\n  for (const [s, e] of iv) { if (!cur || s > cur[1]) { if (cur) a.seconds += (cur[1] - cur[0]) / 1000; cur = [s, e]; } else cur[1] = Math.max(cur[1], e); }\n  if (cur) a.seconds += (cur[1] - cur[0]) / 1000;\n}\nconst qa = {};\nfor (const q of questions) {\n  const e = email(q.email); if (!e) continue;\n  const d = Array.isArray(q.question_details) ? q.question_details : [];\n  const x = (qa[e] = qa[e] || { asked: 0, answered: 0, firstQuestion: null });\n  for (const qd of d) { x.asked++; if (qd.answer || (qd.question_status && qd.question_status !== 'open')) x.answered++; if (!x.firstQuestion && qd.question) x.firstQuestion = String(qd.question).slice(0, 200); }\n}\nlet ledger = {};\ntry { ledger = $getWorkflowStaticData('global').zoomEngagementLedger || {}; } catch (e) { ledger = {}; }\nstats.alreadySynced = 0;\nconst out = [];\nfor (const a of Object.values(by)) {\n  if (ledger[`attended:${w.uuid}:${a.email}`]) { stats.alreadySynced++; continue; } // a redelivered webinar.ended\n\n  const minutes = Math.round(a.seconds / 60);\n  const pct = Math.min(100, Math.round((minutes / webinarMinutes) * 100));\n  const q = qa[a.email] || { asked: 0, answered: 0, firstQuestion: null };\n  const tier = minutes < MIN_MIN ? 'brief' : pct >= HOT || (pct >= 50 && q.asked > 0) ? 'hot' : pct >= WARM || q.asked > 0 ? 'warm' : 'cold';\n  stats.attendees++;\n  out.push({ json: { run: ctx.run, sandboxFixtures: ctx.sandboxFixtures, deliveryRef: ctx.deliveryRef, eventName: 'webinar.ended', kind: 'event', route: 'contact', ledgerKey: `attended:${w.uuid}:${a.email}`, webinar: w,\n    engagement: { type: 'attended', email: a.email, registrantId: a.registrantId, occurredAt: new Date(a.lastLeave || Date.now()).toISOString(), firstJoin: a.firstJoin ? new Date(a.firstJoin).toISOString() : null,\n      lastLeave: a.lastLeave ? new Date(a.lastLeave).toISOString() : null, attendedMinutes: minutes, attendancePct: pct, sessions: a.sessions, questionsAsked: q.asked, questionsAnswered: q.answered,\n      firstQuestion: INCLUDE_Q_TEXT ? q.firstQuestion : null, engagementTier: tier }, reportStats: stats } });\n}\nif (!out.length) out.push({ json: { run: ctx.run, deliveryRef: ctx.deliveryRef, eventName: 'webinar.ended', kind: 'ignored', reason: errors.length ? 'report_unavailable' : stats.alreadySynced ? 'already_synced' : 'no_external_attendees', webinar: w, reportStats: stats } });\nreturn out;\n"
+      },
+      "id": "a595b29e-a170-5780-870c-f60580e35df4",
+      "name": "Build Attendance Summaries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        160
+      ],
+      "notes": "Merges sessions per attendee · overlap-safe minutes · Q&A counts · engagement tier."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "eeee0c53-3f06-5645-881e-ee1a502dded4",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "event",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "007b2621-20c7-50de-a230-fc7edca7b11b",
+      "name": "Attendees Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Contact Lookup                  Mode: Run Once for Each Item\n// Primary e-mail first, then HubSpot's additional e-mails.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst P = env('ZOOM_PROPERTY_PREFIX', 'zoom_');\nconst e = $json.engagement.email;\nreturn { json: { ...$json, prefix: P, contactSearch: {\n  filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: e }] }, { filters: [{ propertyName: 'hs_additional_emails', operator: 'CONTAINS_TOKEN', value: e }] }],\n  properties: ['email', 'firstname', 'lastname', 'hs_additional_emails', ...['webinars_registered_count', 'webinars_attended_count', 'webinar_minutes_total', 'webinar_questions_total', 'last_webinar_uuid',\n    'last_webinar_registered_uuid', 'last_webinar_attended_at', 'webinar_engagement_tier'].map((x) => `${P}${x}`)], limit: 5 } } };\n"
+      },
+      "id": "983e0855-8da2-5216-9661-8f9b6cf03996",
+      "name": "Build Contact Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9f8dfe74-c69e-5ae2-8475-45bae67ee95a",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a713a47-ca4d-5cca-9304-a62698a00e6f",
+      "name": "Sandbox HubSpot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Contact Search (Sandbox)     Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json; const e = item.engagement.email;\nconst list = ((item.sandboxFixtures || {}).contacts || []).filter((c) => c.properties.email === e || String(c.properties.hs_additional_emails || '').toLowerCase().split(';').includes(e));\nreturn { json: { ...item, simulatedContact: { statusCode: 200, body: { total: list.length, results: list.map((c) => ({ id: c.id, properties: c.properties })) } } } };\n"
+      },
+      "id": "ee53bb0e-6f00-5523-831c-e507a2dd85c0",
+      "name": "Simulate Contact Search (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/contacts/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.contactSearch) }}"
+      },
+      "id": "410c4d6b-b5d6-5a01-9bbe-ebb552335751",
+      "name": "Search Contact by Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        500
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.contacts.read · email, then hs_additional_emails."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Plan Contact & Custom Event Updates   Mode: Run Once for Each Item\n// Contact: primary e-mail match, else additional e-mail. Unknown e-mails are\n// created only for registrations (CREATE_CONTACT_ON_REGISTRATION) or, if\n// enabled, attendees (CREATE_CONTACT_FOR_ATTENDEES).\n// Contact properties: latest webinar facts plus running totals. Totals are\n// guarded by the webinar UUID already stored on the contact, so a replay\n// never counts the same webinar twice.\n// Custom events (timeline): registered · joined · left · attended ·\n// qa_participated, sent together through /events/v3/send/batch.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nlet crypto = null; try { crypto = require('crypto'); } catch (e) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst CREATE_REG = flag('CREATE_CONTACT_ON_REGISTRATION', true);\nconst CREATE_ATT = flag('CREATE_CONTACT_FOR_ATTENDEES', false);\nconst JOIN_LEAVE_EVENTS = flag('SEND_JOIN_LEAVE_EVENTS', true);\nconst placeholder = (v) => !v || /^YOUR_/i.test(String(v));\nconst sandbox = !!($json && $json.simulatedContact);\nconst ctx = sandbox ? $json : $('Build Contact Lookup').item.json;\nconst res = sandbox ? $json.simulatedContact : $json;\nconst P = ctx.prefix; const g = ctx.engagement; const w = ctx.webinar;\nlet portal = env('HUBSPOT_PORTAL_ID', '');\nif (placeholder(portal) && SANDBOX_MODE && ctx.sandboxFixtures) portal = ctx.sandboxFixtures.portalId;\nconst eventName = (type) => { const v = env(`HUBSPOT_EVENT_${type.toUpperCase()}`, ''); if (!placeholder(v)) return v; return placeholder(portal) ? null : `pe${portal}_zoom_webinar_${type}`; };\n\nconst errors = [];\nlet contact = null; let matchedOn = null;\nif (Number(res && res.statusCode) !== 200 || !res.body || !Array.isArray(res.body.results)) errors.push(`contact search ${(res && res.statusCode) || 'network error'}`);\nelse {\n  const list = res.body.results;\n  const exact = list.find((c) => String((c.properties || {}).email || '').toLowerCase() === g.email);\n  const extra = list.find((c) => String((c.properties || {}).hs_additional_emails || '').toLowerCase().split(';').map((s) => s.trim()).includes(g.email));\n  const c = exact || extra;\n  if (c) { contact = { id: String(c.id), properties: c.properties || {} }; matchedOn = exact ? 'primary_email' : 'additional_email'; }\n}\nconst cp = (n) => (contact ? contact.properties[`${P}${n}`] : null);\nconst nz = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst holds = []; const notes = [];\nconst canCreate = (g.type === 'registered' && CREATE_REG) || (g.type === 'attended' && CREATE_ATT);\nlet action = contact ? 'update' : canCreate ? 'create' : 'skip';\nif (errors.length) { action = 'skip'; holds.push(errors.join('; ')); }\nelse if (!contact && !canCreate) holds.push(g.type === 'registered' ? 'no contact and CREATE_CONTACT_ON_REGISTRATION=false' : 'no HubSpot contact for this attendee');\n\nconst props = { [`${P}last_engagement_at`]: g.occurredAt };\nlet countedAlready = false;\nif (g.type === 'registered') {\n  countedAlready = cp('last_webinar_registered_uuid') === w.uuid;\n  Object.assign(props, { [`${P}last_webinar_registered_at`]: g.occurredAt, [`${P}last_webinar_registered_topic`]: w.topic, [`${P}last_webinar_registered_uuid`]: w.uuid });\n  if (!countedAlready) props[`${P}webinars_registered_count`] = nz(cp('webinars_registered_count')) + 1;\n  const fill = { firstname: g.firstName, lastname: g.lastName, company: g.company, jobtitle: g.jobTitle };\n  for (const [k, v] of Object.entries(fill)) if (v && (!contact || !contact.properties[k])) props[k] = v; // never overwrite existing CRM values\n} else if (g.type === 'joined') props[`${P}last_webinar_joined_at`] = g.occurredAt;\nelse if (g.type === 'left') props[`${P}last_webinar_left_at`] = g.occurredAt;\nelse if (g.type === 'attended') {\n  countedAlready = cp('last_webinar_uuid') === w.uuid;\n  Object.assign(props, { [`${P}last_webinar_attended_at`]: g.lastLeave || g.occurredAt, [`${P}last_webinar_topic`]: w.topic, [`${P}last_webinar_uuid`]: w.uuid, [`${P}last_webinar_minutes`]: g.attendedMinutes,\n    [`${P}last_webinar_attendance_pct`]: g.attendancePct, [`${P}last_webinar_questions`]: g.questionsAsked, [`${P}webinar_engagement_tier`]: g.engagementTier });\n  if (!countedAlready) Object.assign(props, { [`${P}webinars_attended_count`]: nz(cp('webinars_attended_count')) + 1, [`${P}webinar_minutes_total`]: nz(cp('webinar_minutes_total')) + g.attendedMinutes,\n    [`${P}webinar_questions_total`]: nz(cp('webinar_questions_total')) + g.questionsAsked });\n}\nif (countedAlready) notes.push('webinar already counted on this contact; totals unchanged');\nif (action === 'create') props.email = g.email;\n\nconst s = (v) => (v === null || v === undefined ? undefined : String(v));\nconst base = { webinar_id: s(w.id), webinar_uuid: s(w.uuid), webinar_topic: s(w.topic), webinar_start_time: s(w.startTime), engagement_type: g.type, registrant_id: s(g.registrantId) };\nconst evs = [];\nconst push = (type, extra) => { const name = eventName(type); if (!name) { holds.push(`custom event name for '${type}' not configured (HUBSPOT_PORTAL_ID or HUBSPOT_EVENT_${type.toUpperCase()})`); return; }\n  const properties = Object.fromEntries(Object.entries({ ...base, ...extra }).filter(([, v]) => v !== undefined));\n  let uuid = null; if (crypto) { const h = crypto.createHash('sha256').update(`${ctx.ledgerKey}|${type}`).digest('hex'); uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`; }\n  evs.push({ type, eventName: name, occurredAt: g.occurredAt, properties, uuid }); };\nif (g.type === 'registered') push('registered', { registration_status: s(g.status) });\nif (g.type === 'joined' && JOIN_LEAVE_EVENTS) push('joined', { join_time: s(g.occurredAt) });\nif (g.type === 'left' && JOIN_LEAVE_EVENTS) push('left', { join_time: s(g.joinTime), leave_time: s(g.occurredAt), session_minutes: s(g.sessionMinutes), leave_reason: s(g.leaveReason) });\nif (g.type === 'attended') {\n  push('attended', { first_join_time: s(g.firstJoin), last_leave_time: s(g.lastLeave), attended_minutes: s(g.attendedMinutes), attendance_pct: s(g.attendancePct), sessions: s(g.sessions),\n    questions_asked: s(g.questionsAsked), engagement_tier: g.engagementTier });\n  if (g.questionsAsked > 0) push('qa_participated', { questions_asked: s(g.questionsAsked), questions_answered: s(g.questionsAnswered), ...(g.firstQuestion ? { first_question: g.firstQuestion } : {}) });\n}\nconst write = action !== 'skip';\nconst { simulatedContact, contactSearch, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    contactMatch: { action, contactId: contact ? contact.id : null, matchedOn, countedAlready, errors },\n    plan: { write, holds, notes, properties: props, events: write ? evs : [], eventCount: write ? evs.length : 0 },\n    requests: write ? {\n      upsert: { inputs: [contact ? { id: contact.id, properties: props } : { idProperty: 'email', id: g.email, properties: props }] },\n      upsertPath: contact ? '/crm/v3/objects/contacts/batch/update' : '/crm/v3/objects/contacts/batch/upsert',\n    } : null,\n  },\n};\n"
+      },
+      "id": "1b1fbdcc-7cfd-50c4-bfb6-447d76023bce",
+      "name": "Plan Contact & Custom Event Updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        400
+      ],
+      "notes": "Create rules · latest-webinar properties · UUID-guarded totals · custom events."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "af32f99a-796c-5e09-a0ca-59f9b08f5ba2",
+              "leftValue": "={{ $json.plan.write }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0fb32ec-3fe7-59f2-9ba7-60179722dd49",
+      "name": "Has Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3840,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c5c4290a-0e49-5559-a4d2-0b2aa8ba559b",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9865bf5e-6817-5cfd-a838-9e3631a39dec",
+      "name": "Live Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Writes (Dry Run)     Mode: Run Once for Each Item\n// No network call. Shows the contact update and the timeline events.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst { requests, ...rest } = item;\nreturn { json: { ...rest, sync: { mode: item.run.mode, simulated: true, ok: true, contactAction: item.contactMatch.action, contactId: item.contactMatch.contactId, eventsSent: 0,\n  wouldSend: item.plan.events.map((e) => e.eventName) }, preview: { path: requests.upsertPath, properties: item.plan.properties, events: item.plan.events } } };\n"
+      },
+      "id": "e17eb56d-6b45-5204-8059-1ead26f51f0e",
+      "name": "Simulate HubSpot Writes (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}{{ $json.requests.upsertPath }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requests.upsert) }}"
+      },
+      "id": "9eedf3e8-c497-544b-9acb-6d4ef13808c4",
+      "name": "Upsert Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "batch/update (known contact) or batch/upsert by e-mail (new registrant) · idempotent, retried."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Contact Result                Mode: Run Once for Each Item\n// Reads the contact ID from batch update / upsert and builds the custom\n// event batch against that object ID.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZOOM_WEBHOOK_SECRET', 'ZOOM_CLIENT_SECRET', 'ZOOM_CLIENT_ID', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Live Writes?').item.json;\nconst res = $json || {};\nconst status = Number(res.statusCode || 0);\nconst errs = res.body && Array.isArray(res.body.errors) ? res.body.errors : [];\nconst id = status >= 200 && status < 300 && !errs.length && res.body && Array.isArray(res.body.results) && res.body.results[0] ? String(res.body.results[0].id) : null;\nconst { requests, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    contactWrite: { ok: !!id, contactId: id, httpStatus: status || null, message: id ? null : redactString((errs[0] && errs[0].message) || (res.body && res.body.message) || 'contact write failed').slice(0, 200) },\n    sendEvents: !!id && ctx.plan.events.length > 0,\n    eventBatch: id ? { inputs: ctx.plan.events.map((e) => ({ eventName: e.eventName, objectId: id, occurredAt: e.occurredAt, properties: e.properties, ...(e.uuid ? { uuid: e.uuid } : {}) })) } : null,\n  },\n};\n"
+      },
+      "id": "961d430a-5066-56b1-8ba6-790df7b67aca",
+      "name": "Capture Contact Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b7f8f005-cc81-519a-a86e-cdadada37ee5",
+              "leftValue": "={{ $json.sendEvents }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ac6c4a99-8940-5836-9a00-c68afedcee13",
+      "name": "Send Events?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4800,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/events/v3/send/batch",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.eventBatch) }}"
+      },
+      "id": "baeba4bc-7729-57d4-bf2e-4e6c5b6e5397",
+      "name": "Send Custom Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5040,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Scope analytics.behavioral_events.send · events need existing definitions (pe{portalId}_…) · not auto-retried."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Sync Result                    Mode: Run Once for Each Item\n// Writes the idempotency ledger once the contact and all events succeeded.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZOOM_WEBHOOK_SECRET', 'ZOOM_CLIENT_SECRET', 'ZOOM_CLIENT_ID', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst fromSend = !($json && $json.contactWrite);\nconst ctx = fromSend ? $('Capture Contact Result').item.json : $json;\nconst res = fromSend ? $json || {} : null;\nconst evStatus = res ? Number(res.statusCode || 0) : null;\nconst eventsOk = !ctx.sendEvents || (evStatus >= 200 && evStatus < 300);\nconst ok = ctx.contactWrite.ok && eventsOk;\nif (ok) {\n  try { const store = $getWorkflowStaticData('global'); store.zoomEngagementLedger = store.zoomEngagementLedger || {}; store.zoomEngagementLedger[ctx.ledgerKey] = { at: Date.now() }; } catch (e) { /* best effort */ }\n}\nconst { eventBatch, ...rest } = ctx;\nreturn { json: { ...rest, sync: { mode: 'live', simulated: false, ok, contactAction: ctx.contactMatch.action, contactId: ctx.contactWrite.contactId, contactStatus: ctx.contactWrite.httpStatus,\n  eventsSent: ctx.sendEvents && eventsOk ? ctx.plan.events.length : 0, eventStatus: evStatus,\n  message: ok ? null : !ctx.contactWrite.ok ? ctx.contactWrite.message : redactString((res.body && res.body.message) || 'custom event send failed').slice(0, 200) } } };\n"
+      },
+      "id": "582ff3c5-2eb8-53dc-8b78-98ad0a8bab44",
+      "name": "Record Sync Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                          Mode: Run Once for Each Item\n// One redacted record per delivery or attendee: IDs, types, counts and\n// engagement metrics. E-mails are masked; names and question text are\n// never logged.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZOOM_WEBHOOK_SECRET', 'ZOOM_CLIENT_SECRET', 'ZOOM_CLIENT_ID', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 500));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\nconst maskEmail = (e) => { if (!e) return null; const [u, d] = String(e).split('@'); return d ? `${u[0]}***@${d}` : null; };\nconst item = $json; const g = item.engagement || null; const w = item.webinar || null;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  mode: item.run ? item.run.mode : null,\n  deliveryRef: item.deliveryRef || null,\n  zoomEvent: item.eventName || null,\n  kind: item.kind || null,\n  reason: item.reason || null,\n  httpStatus: item.httpStatus || null,\n  webinar: w ? { id: w.id, uuid: w.uuid } : null,\n  engagement: g ? { type: g.type, email: maskEmail(g.email), attendedMinutes: g.attendedMinutes ?? g.sessionMinutes ?? null, attendancePct: g.attendancePct ?? null, sessions: g.sessions ?? null,\n    questionsAsked: g.questionsAsked ?? null, tier: g.engagementTier || null } : null,\n  reportStats: item.reportStats ? { rows: item.reportStats.reportRows, attendees: item.reportStats.attendees, excludedInternal: item.reportStats.excludedInternal, excludedNoEmail: item.reportStats.excludedNoEmail, questions: item.reportStats.questions, errors: item.reportStats.errors } : null,\n  contact: item.contactMatch ? { action: item.contactMatch.action, contactId: item.contactMatch.contactId, matchedOn: item.contactMatch.matchedOn, countedAlready: item.contactMatch.countedAlready } : null,\n  plan: item.plan ? { write: item.plan.write, propertyCount: Object.keys(item.plan.properties).length, events: item.plan.events.map((e) => e.type), holds: item.plan.holds } : null,\n  sync: item.sync ? { simulated: item.sync.simulated, ok: item.sync.ok, contactId: item.sync.contactId, eventsSent: item.sync.eventsSent, message: item.sync.message || null } : null,\n});\nif (LOG_TO_STDOUT) { try { console.log(`[zoom-engagement] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ } }\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.zoomEngagementAudit)) store.zoomEngagementAudit = [];\n    store.zoomEngagementAudit.push(record);\n    if (store.zoomEngagementAudit.length > RING_SIZE) store.zoomEngagementAudit.splice(0, store.zoomEngagementAudit.length - RING_SIZE);\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\nreturn { json: record };\n"
+      },
+      "id": "00798d4d-66b2-557a-85ed-cd23037b8dda",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        300
+      ],
+      "notes": "Masked e-mails, metrics and IDs only · stdout + ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "f317303f-59cb-5491-a7b6-57b6cbbdac5e",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZOOM_WEBHOOK_SECRET', 'ZOOM_CLIENT_SECRET', 'ZOOM_CLIENT_ID', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'zoom_engagement_sync_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[zoom-engagement:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Zoom webinar engagement sync failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Zoom webinar engagement sync failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · Zoom events received while this was failing were not synced; re-run the webinar report sync for affected webinars` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "f2362fb8-53fa-5fdb-b357-00cea6c11b9e",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b969f8f3-f482-5c60-b5a3-c0ffd24ce44b",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d17916bc-8387-58af-a2b8-4b4f6c4d4a4f",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "e0572303-de0a-55cc-a76e-d69a3337eeb4",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-zoom-webinar-hubspot-engagement-sync\nZoom webinar registration, attendance and Q&A → HubSpot contact properties + custom timeline events. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No Zoom API, HubSpot or Slack calls until both are `false`.\n\n**Stage 1** Execute *Zoom Webhook Trigger* (12 fictional deliveries).\n**Stage 2** `SANDBOX_MODE=false`: real Zoom reports + contact search, writes simulated.\n**Stage 3** `DRY_RUN=false`: contact updates and custom events go live.\n\nActivate the workflow before saving the endpoint in Zoom (URL validation).",
+        "height": 320,
+        "width": 720,
+        "color": 4
+      },
+      "id": "69505f4c-b6b3-51f3-a6b7-212a3d554dab",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### After webinar.ended\nWait → Server-to-Server OAuth token → Q&A report → participants report (paged) → one summary per external attendee.",
+        "height": 110,
+        "width": 640,
+        "color": 3
+      },
+      "id": "ee043ffa-0b92-5e74-ad1e-9a167e871de7",
+      "name": "Sticky: Reports",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1400,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or bodies. Secrets, access tokens and webhook URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "a5386797-106d-5337-b26f-d41b0820b2b6",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "Zoom Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature & Normalize Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature & Normalize Event": {
+      "main": [
+        [
+          {
+            "node": "Route by Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Kind": {
+      "main": [
+        [
+          {
+            "node": "Respond URL Validation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Acknowledge Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Rejected or Ignored",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond URL Validation": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Rejected or Ignored": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acknowledge Event": {
+      "main": [
+        [
+          {
+            "node": "Webinar Ended?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webinar Ended?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Reports?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Contact Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Reports?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Zoom Reports (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait for Zoom Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Zoom Reports (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Build Attendance Summaries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Zoom Reports": {
+      "main": [
+        [
+          {
+            "node": "Get Zoom Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Zoom Access Token": {
+      "main": [
+        [
+          {
+            "node": "Fetch Q&A Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Q&A Report": {
+      "main": [
+        [
+          {
+            "node": "Fetch Participants Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Participants Report": {
+      "main": [
+        [
+          {
+            "node": "Build Attendance Summaries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Attendance Summaries": {
+      "main": [
+        [
+          {
+            "node": "Attendees Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attendees Found?": {
+      "main": [
+        [
+          {
+            "node": "Build Contact Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Contact Lookup": {
+      "main": [
+        [
+          {
+            "node": "Sandbox HubSpot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox HubSpot?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Contact Search (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Contact by Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Contact Search (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Plan Contact & Custom Event Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Contact by Email": {
+      "main": [
+        [
+          {
+            "node": "Plan Contact & Custom Event Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Contact & Custom Event Updates": {
+      "main": [
+        [
+          {
+            "node": "Has Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Writes?": {
+      "main": [
+        [
+          {
+            "node": "Live Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes?": {
+      "main": [
+        [
+          {
+            "node": "Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate HubSpot Writes (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Writes (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "Capture Contact Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Contact Result": {
+      "main": [
+        [
+          {
+            "node": "Send Events?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Events?": {
+      "main": [
+        [
+          {
+            "node": "Send Custom Events",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Sync Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Custom Events": {
+      "main": [
+        [
+          {
+            "node": "Record Sync Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Sync Result": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Zoom Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=32a8bba49ee06c09818a2dff5cec82cb3de7146c4f14c5d287409f6045d73a36",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "endpoint.url_validation",
+            "event_ts": 1794320000000,
+            "payload": {
+              "plainToken": "fxPlainToken0001abcd"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT url_validation → { plainToken, encryptedToken }",
+          "sandboxFixtures": {
+            "portalId": "0000000",
+            "internalDomains": [
+              "dhrobin-fixture.example"
+            ],
+            "contacts": [
+              {
+                "id": "sandbox-contact-101",
+                "properties": {
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "firstname": "Alex",
+                  "lastname": "Rivera",
+                  "zoom_webinars_registered_count": "2",
+                  "zoom_webinars_attended_count": "1",
+                  "zoom_webinar_minutes_total": "40",
+                  "zoom_webinar_questions_total": "0"
+                }
+              },
+              {
+                "id": "sandbox-contact-102",
+                "properties": {
+                  "email": "jordan.lee@contoso-fixture.example",
+                  "firstname": "Jordan",
+                  "zoom_webinars_attended_count": "3",
+                  "zoom_webinar_minutes_total": "150",
+                  "zoom_webinar_questions_total": "2",
+                  "zoom_last_webinar_uuid": "fxW1nAr0000Uuid0001=="
+                }
+              },
+              {
+                "id": "sandbox-contact-103",
+                "properties": {
+                  "email": "m.chen@adatum-fixture.example",
+                  "hs_additional_emails": "morgan.chen@adatum-fixture.example",
+                  "firstname": "Morgan",
+                  "lastname": "Chen"
+                }
+              }
+            ],
+            "reports": {
+              "fxW1nAr0000Uuid0001==": {
+                "participants": [
+                  {
+                    "id": "p1",
+                    "user_id": "p1",
+                    "name": "Alex Rivera",
+                    "user_email": "alex.rivera@northwind-fixture.example",
+                    "join_time": "2026-11-12T15:02:00Z",
+                    "leave_time": "2026-11-12T15:40:00Z",
+                    "duration": 2280,
+                    "registrant_id": "fxReg-alex",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p2",
+                    "user_id": "p2",
+                    "name": "Alex Rivera (phone)",
+                    "user_email": "alex.rivera@northwind-fixture.example",
+                    "join_time": "2026-11-12T15:10:00Z",
+                    "leave_time": "2026-11-12T15:20:00Z",
+                    "duration": 600,
+                    "registrant_id": "fxReg-alex",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p3",
+                    "user_id": "p3",
+                    "name": "Alex Rivera",
+                    "user_email": "alex.rivera@northwind-fixture.example",
+                    "join_time": "2026-11-12T15:45:00Z",
+                    "leave_time": "2026-11-12T16:00:00Z",
+                    "duration": 900,
+                    "registrant_id": "fxReg-alex",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p4",
+                    "user_id": "p4",
+                    "name": "Priya Nair",
+                    "user_email": "priya.nair@harbor-fixture.example",
+                    "join_time": "2026-11-12T15:05:00Z",
+                    "leave_time": "2026-11-12T15:27:00Z",
+                    "duration": 1320,
+                    "registrant_id": "fxReg-priya",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p5",
+                    "user_id": "p5",
+                    "name": "Jordan Lee",
+                    "user_email": "jordan.lee@contoso-fixture.example",
+                    "join_time": "2026-11-12T15:00:00Z",
+                    "leave_time": "2026-11-12T15:58:00Z",
+                    "duration": 3480,
+                    "registrant_id": "",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p6",
+                    "user_id": "p6",
+                    "name": "Morgan Chen",
+                    "user_email": "morgan.chen@adatum-fixture.example",
+                    "join_time": "2026-11-12T15:20:00Z",
+                    "leave_time": "2026-11-12T15:45:00Z",
+                    "duration": 1500,
+                    "registrant_id": "fxReg-morgan",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p7",
+                    "user_id": "p7",
+                    "name": "Taylor Kim",
+                    "user_email": "taylor.kim@lumen-fixture.example",
+                    "join_time": "2026-11-12T15:50:00Z",
+                    "leave_time": "2026-11-12T15:53:00Z",
+                    "duration": 180,
+                    "registrant_id": "",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p8",
+                    "user_id": "p8",
+                    "name": "Events Team (host)",
+                    "user_email": "events-team@dhrobin-fixture.example",
+                    "join_time": "2026-11-12T14:55:00Z",
+                    "leave_time": "2026-11-12T16:02:00Z",
+                    "duration": 4020,
+                    "registrant_id": "",
+                    "failover": false,
+                    "status": "in_meeting"
+                  },
+                  {
+                    "id": "p9",
+                    "user_id": "p9",
+                    "name": "iPad Guest",
+                    "user_email": "",
+                    "join_time": "2026-11-12T15:05:00Z",
+                    "leave_time": "2026-11-12T15:30:00Z",
+                    "duration": 1500,
+                    "registrant_id": "",
+                    "failover": false,
+                    "status": "in_meeting"
+                  }
+                ],
+                "questions": [
+                  {
+                    "name": "Alex Rivera",
+                    "email": "alex.rivera@northwind-fixture.example",
+                    "question_details": [
+                      {
+                        "question": "How do you handle duplicate companies in the fixture portal?",
+                        "answer": "We merge by domain weekly.",
+                        "question_status": "answered"
+                      },
+                      {
+                        "question": "Will the slides be shared?",
+                        "answer": "",
+                        "question_status": "open"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "Jordan Lee",
+                    "email": "jordan.lee@contoso-fixture.example",
+                    "question_details": [
+                      {
+                        "question": "Which lifecycle stage triggers routing?",
+                        "answer": "live answered",
+                        "question_status": "answered"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "Anonymous Attendee",
+                    "email": "",
+                    "question_details": [
+                      {
+                        "question": "Is there a recording?",
+                        "answer": "",
+                        "question_status": "open"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=20f59189f0d8504a5e8ea31cc89caaf9f428f9bfc8327cf96ca79abb9a8e5994",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794326400000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-alex",
+                  "first_name": "Alex",
+                  "last_name": "Rivera",
+                  "email": "Alex.Rivera@Northwind-Fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T14:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT registered · existing contact (e-mail case-normalised) · count 2 → 3 · registered event"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=9b2869cf7cb6f540a546a1a5e2cab44c9db8b2b446dc0c9fa4e6517bcfccd84e",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794330000000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-priya",
+                  "first_name": "Priya",
+                  "last_name": "Nair",
+                  "email": "priya.nair@harbor-fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T15:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link",
+                  "org": "Harbor Fixture Logistics",
+                  "job_title": "RevOps Manager"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT registered · new contact created by e-mail upsert (name, company, job title) · join_url never stored"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=4e7d7fc1a917412222b20d7ad8bda0d1411bb29a6806b2d8580c4e3c09ada4d4",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794333600000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-morgan",
+                  "first_name": "Morgan",
+                  "last_name": "Chen",
+                  "email": "morgan.chen@adatum-fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T16:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT registered · matched on hs_additional_emails"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=0a1fe31bd39bed0c7ac86cd3ff46ae6edf8266b873e654450436254c4c0dd53f",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794337200000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-team",
+                  "first_name": "Events",
+                  "last_name": "Team",
+                  "email": "events-team@dhrobin-fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T14:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · internal_email_domain"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=7677ac5fdbc6f39f88ef82af52bcf295a9ab3a90112a92115976b8f515d75cef",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.participant_joined",
+            "event_ts": 1794496920000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "participant": {
+                  "user_id": "16778240",
+                  "user_name": "Alex Rivera",
+                  "id": "fxReg-alex",
+                  "participant_uuid": "fxPart-alex-1",
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "registrant_id": "fxReg-alex",
+                  "join_time": "2026-11-12T15:02:00Z"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT joined event (join time on timeline)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=53eaedd0b3e2a05a4636ae84f356a527df48135341818ca09dd6d5f8ce584e8e",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.participant_left",
+            "event_ts": 1794499200000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "participant": {
+                  "user_id": "16778240",
+                  "user_name": "Alex Rivera",
+                  "id": "fxReg-alex",
+                  "participant_uuid": "fxPart-alex-1",
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "registrant_id": "fxReg-alex",
+                  "join_time": "2026-11-12T15:02:00Z",
+                  "leave_time": "2026-11-12T15:40:00Z",
+                  "leave_reason": "left the webinar"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT left event · session 38 min"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=8c778e2a506daca2df33ef9dcfe012e83325ebf2377f04ff916b306039dbc905",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.participant_joined",
+            "event_ts": 1794497100000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "participant": {
+                  "user_id": "16778300",
+                  "user_name": "iPad Guest",
+                  "id": "",
+                  "participant_uuid": "fxPart-guest-1",
+                  "email": "",
+                  "registrant_id": "",
+                  "join_time": "2026-11-12T15:05:00Z"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · participant_without_email"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=20f59189f0d8504a5e8ea31cc89caaf9f428f9bfc8327cf96ca79abb9a8e5994",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794326400000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-alex",
+                  "first_name": "Alex",
+                  "last_name": "Rivera",
+                  "email": "Alex.Rivera@Northwind-Fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T14:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · duplicate_event (Zoom retry)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=4157f04b77f25cc0669e4e90c58abe2d01f9396de5b6362f963973f719947365",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "meeting.started",
+            "event_ts": 1794496800000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "id": "123",
+                "uuid": "fxMeeting==",
+                "topic": "Internal standup"
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · event_type_not_processed"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=56a03cf2e26d8171a534510b16526deb51cff2a7d9d4a185e5c3331812d1dbad",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.registration_created",
+            "event_ts": 1794340000000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "registrant": {
+                  "id": "fxReg-spoof",
+                  "first_name": "Spoof",
+                  "last_name": "Fixture",
+                  "email": "spoof@nimbus-fixture.example",
+                  "status": "approved",
+                  "create_time": "2026-11-10T14:00:00Z",
+                  "join_url": "https://zoom.example/w/fixture-personal-link"
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected 401 · signature_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json; charset=utf-8",
+            "x-zm-signature": "v0=3ee3503b0ee1ebdaa3fcccb0f06eeffb80481f16415773384eff17d047dee4ce",
+            "x-zm-request-timestamp": "1794500000000",
+            "user-agent": "Zoom Marketplace/1.0a (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "webinar.ended",
+            "event_ts": 1794500000000,
+            "payload": {
+              "account_id": "fxAccount0001",
+              "object": {
+                "uuid": "fxW1nAr0000Uuid0001==",
+                "id": "81234567890",
+                "host_id": "fxHostUser01",
+                "topic": "Fixture Webinar: Pipeline Hygiene Live",
+                "type": 5,
+                "start_time": "2026-11-12T15:00:00Z",
+                "duration": 60,
+                "timezone": "America/New_York",
+                "end_time": "2026-11-12T16:00:00Z"
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/zoom-webinar-engagement",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT reports → alex hot (53 min, 2 Qs, overlap merged) · priya cold (22) · jordan hot but already counted · morgan warm · taylor brief, no contact · host + no-email excluded"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
